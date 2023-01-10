@@ -73,8 +73,19 @@ const (
 	// HibernatePgControlDataAnnotationName contains the pg_controldata output of the hibernated cluster
 	HibernatePgControlDataAnnotationName = "cnpg.io/hibernatePgControlData"
 
+	// HibernatingStatusAnnotationName contains a boolean value indicating if the cluster is hibernating
+	HibernatingStatusAnnotationName = "k8s.enterprisedb.io/hibernatingStatus"
+
 	// skipEmptyWalArchiveCheck turns off the checks that ensure that the WAL archive is empty before writing data
 	skipEmptyWalArchiveCheck = "cnpg.io/skipEmptyWalArchiveCheck"
+)
+
+const (
+	// ClusterHibernating is the value of the HibernatingStatusAnnotationName for when the cluster is hibernating
+	ClusterHibernating = "true"
+
+	// ClusterNotHibernating is the value of the HibernatingStatusAnnotationName for when the cluster is not hibernating
+	ClusterNotHibernating = "false"
 )
 
 type annotationStatus string

@@ -142,7 +142,7 @@ type ClusterSpec struct {
 	PostgresGID int64 `json:"postgresGID,omitempty"`
 
 	// Number of instances required in the cluster
-	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default:=1
 	Instances int `json:"instances"`
 
@@ -463,6 +463,9 @@ type ClusterStatus struct {
 
 	// List of instance names in the cluster
 	InstanceNames []string `json:"instanceNames,omitempty"`
+
+	// Boolean to indicate if the cluster is hibernating
+	Hibernating bool `json:"hibernating,omitempty"`
 }
 
 // InstanceReportedState describes the last reported state of an instance during a reconciliation loop

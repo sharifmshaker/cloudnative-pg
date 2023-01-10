@@ -19,6 +19,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -37,7 +38,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/exec"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -63,6 +66,14 @@ const (
 )
 
 var apiGVString = apiv1.GroupVersion.String()
+
+// https://www.postgresql.org/docs/current/app-pg-ctl.html
+type pgCtlStatusExitCode int
+
+const (
+	pgCtlStatusStopped               pgCtlStatusExitCode = 3
+	pgCtlStatusNoAccessibleDirectory pgCtlStatusExitCode = 4
+)
 
 // ClusterReconciler reconciles a Cluster objects
 type ClusterReconciler struct {
@@ -197,8 +208,10 @@ func (r *ClusterReconciler) reconcile(ctx context.Context, cluster *apiv1.Cluste
 	}
 
 	// Ensure we reconcile the orphan resources if present when we reconcile for the first time a cluster
-	if err := r.reconcileRestoredCluster(ctx, cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("cannot reconcile restored Cluster: %w", err)
+	if cluster.Annotations[utils.HibernatingStatusAnnotationName] != utils.ClusterHibernating {
+		if err := r.reconcileRestoredCluster(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot reconcile restored Cluster: %w", err)
+		}
 	}
 
 	// Ensure we have the required global objects
@@ -273,7 +286,8 @@ func (r *ClusterReconciler) reconcile(ctx context.Context, cluster *apiv1.Cluste
 	// negative: this is going to happen, i.e., when an instance is
 	// un-fenced, and the Kubelet still hasn't refreshed the status of the
 	// readiness probe.
-	if instancesStatus.Len() > 0 {
+	if cluster.Annotations[utils.HibernatingStatusAnnotationName] != utils.ClusterHibernating &&
+		instancesStatus.Len() > 0 {
 		isPostgresReady := instancesStatus.Items[0].IsPostgresqlReady()
 		isPodReady := instancesStatus.Items[0].IsPodReady
 
@@ -478,7 +492,8 @@ func (r *ClusterReconciler) reconcileResources(
 		return *result, err
 	}
 
-	if !resources.allInstancesAreActive() {
+	if cluster.Annotations[utils.HibernatingStatusAnnotationName] != utils.ClusterHibernating &&
+		!resources.allInstancesAreActive() {
 		contextLogger.Debug("A managed resource is currently being created or deleted. Waiting")
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
@@ -588,6 +603,12 @@ func (r *ClusterReconciler) ReconcilePVCs(ctx context.Context, cluster *apiv1.Cl
 	resources *managedResources,
 ) error {
 	contextLogger := log.FromContext(ctx)
+	if cluster.Annotations[utils.HibernatingStatusAnnotationName] == utils.ClusterHibernating {
+		if updated, err := r.reconcilePVCsForHibernatingCluster(ctx, cluster, resources); err != nil || updated {
+			return err
+		}
+	}
+
 	if !cluster.ShouldResizeInUseVolumes() {
 		return nil
 	}
@@ -667,6 +688,14 @@ func (r *ClusterReconciler) ReconcilePods(ctx context.Context, cluster *apiv1.Cl
 	}
 
 	if err := r.markPVCReadyForCompletedJobs(ctx, resources); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if cluster.Annotations[utils.HibernatingStatusAnnotationName] == utils.ClusterHibernating {
+		waitingForDeletion, err := r.hibernateCluster(ctx, cluster, resources)
+		if err == nil && waitingForDeletion {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -1246,4 +1275,238 @@ func (r *ClusterReconciler) deleteOldCustomQueriesConfigmap(ctx context.Context,
 			"err", err,
 			"configmap", configuration.Current.MonitoringQueriesConfigmap)
 	}
+}
+
+func (r *ClusterReconciler) allInstancesAreStopped(ctx context.Context, instances []corev1.Pod) (bool, error) {
+	for _, instance := range instances {
+		if isRunning, err := r.instanceIsRunning(ctx, instance); err != nil {
+			return false, err
+		} else if isRunning {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r *ClusterReconciler) instanceIsRunning(ctx context.Context, instance corev1.Pod) (bool, error) {
+	contextLogger := log.FromContext(ctx).WithName("plugin.IsInstanceRunning")
+	contextLogger.Info("Getting instance status", "instance", instance.Name)
+	timeout := time.Second * 2
+	config := ctrl.GetConfigOrDie()
+	clientInterface := kubernetes.NewForConfigOrDie(config)
+	stdout, stderr, err := utils.ExecCommand(
+		ctx,
+		clientInterface,
+		config,
+		instance,
+		specs.PostgresContainerName,
+		&timeout,
+		"pg_ctl", "status")
+	if err == nil {
+		return true, nil
+	}
+
+	var codeExitError exec.CodeExitError
+	if errors.As(err, &codeExitError) {
+		switch pgCtlStatusExitCode(codeExitError.Code) {
+		case pgCtlStatusStopped:
+			return false, nil
+		case pgCtlStatusNoAccessibleDirectory:
+			return false, fmt.Errorf("could not check instance status: no accessible data directory")
+		}
+	}
+
+	if strings.Contains(stdout, "pg_ctl: no server running") {
+		contextLogger.Info("Error code conversion failed, but stdout says no server running")
+		return false, nil
+	}
+
+	contextLogger.Info("Encountered an error while getting instance status",
+		"stdout", stdout,
+		"stderr", stderr,
+		"err", err,
+	)
+
+	return false, err
+}
+
+func (r *ClusterReconciler) reconcilePVCsForHibernatingCluster(ctx context.Context, cluster *apiv1.Cluster,
+	resources *managedResources,
+) (updated bool, err error) {
+	contextLogger := log.FromContext(ctx)
+	contextLogger.Info("Reconciling PVCs for hibernating cluster")
+	if cluster.Annotations[utils.HibernatingStatusAnnotationName] != utils.ClusterHibernating {
+		return false, errors.New("Cluster is not hibernating, cannot reconcile PVCs")
+	}
+	var instancesStopped bool
+	instancesStopped, err = r.allInstancesAreStopped(ctx, resources.instances.Items)
+	if err != nil {
+		return
+	}
+
+	if !instancesStopped || len(resources.instances.Items) == 0 {
+		return
+	}
+
+	var (
+		primaryInstance corev1.Pod
+		pgControlData   string
+	)
+	primaryInstance, err = getPrimaryInstance(resources.instances.Items)
+	if err != nil {
+		return
+	}
+
+	pgControlData, err = getPGControlData(ctx, primaryInstance)
+	if err != nil {
+		return
+	}
+
+	updated, err = r.annotatePVCsForHibernation(ctx, resources.pvcs.Items, cluster, pgControlData)
+	if err != nil {
+		contextLogger.Info("Error annotating PVCs of hibernating cluster",
+			"Cluster", cluster.Name,
+			"error", err.Error())
+		return updated, err
+	}
+
+	if updated {
+		contextLogger.Info("Annotated PVCs for suspended cluster", "Cluster", cluster.Name)
+		return updated, nil
+	}
+
+	updated, err = r.removePVCOwnerReferences(ctx, resources.pvcs.Items, cluster)
+	if err != nil {
+		contextLogger.Info("Error removing owner reference for PVCs of hibernating cluster",
+			"Cluster", cluster.Name,
+			"error", err.Error())
+		return updated, err
+	}
+
+	if updated {
+		contextLogger.Info("Removed owner references of PVCs", "Cluster", cluster.Name)
+	}
+
+	return updated, err
+}
+
+func getPrimaryInstance(instances []corev1.Pod) (corev1.Pod, error) {
+	for _, instance := range instances {
+		if specs.IsPodPrimary(instance) {
+			return instance, nil
+		}
+	}
+
+	return corev1.Pod{}, fmt.Errorf("no primary instance found in list")
+}
+
+func getPGControlData(ctx context.Context,
+	instance corev1.Pod,
+) (string, error) {
+	timeout := time.Second * 2
+	config := ctrl.GetConfigOrDie()
+	clientInterface := kubernetes.NewForConfigOrDie(config)
+	stdout, _, err := utils.ExecCommand(
+		ctx,
+		clientInterface,
+		config,
+		instance,
+		specs.PostgresContainerName,
+		&timeout,
+		"pg_controldata")
+	if err != nil {
+		return "", err
+	}
+
+	return stdout, nil
+}
+
+func (r *ClusterReconciler) annotatePVCsForHibernation(
+	ctx context.Context,
+	pvcs []corev1.PersistentVolumeClaim,
+	cluster *apiv1.Cluster,
+	pgControlData string,
+) (updated bool, err error) {
+	contextLogger := log.FromContext(ctx)
+	updated = false
+	for idx := range pvcs {
+		pvc := pvcs[idx]
+		contextLogger.Info("Annotating PVC for hibernation", "pvc", pvc.Name)
+		if pvc.Annotations == nil {
+			pvc.Annotations = map[string]string{}
+		}
+		newPVC := pvc.DeepCopy()
+
+		_, hasHibernateAnnotation := pvc.Annotations[utils.HibernateClusterManifestAnnotationName]
+		_, hasPgControlDataAnnotation := pvc.Annotations[utils.HibernatePgControlDataAnnotationName]
+		if hasPgControlDataAnnotation && hasHibernateAnnotation {
+			contextLogger.Info("PVC already has hibernation annotations; nothing to do", "PVC Name", pvc.Name)
+			continue
+		}
+
+		bytes, err := json.Marshal(&cluster)
+		if err != nil {
+			return false, err
+		}
+
+		newPVC.Annotations[utils.HibernateClusterManifestAnnotationName] = string(bytes)
+		newPVC.Annotations[utils.HibernatePgControlDataAnnotationName] = pgControlData
+		updated = true
+		err = r.Patch(ctx, newPVC, client.MergeFrom(&pvc))
+		if err != nil {
+			return updated, err
+		}
+		contextLogger.Info("Updated pvc with hibernation annotation", "pvc annotations", newPVC.Annotations)
+	}
+
+	return updated, nil
+}
+
+func (r *ClusterReconciler) removePVCOwnerReferences(
+	ctx context.Context,
+	pvcs []corev1.PersistentVolumeClaim,
+	cluster *apiv1.Cluster,
+) (updated bool, err error) {
+	contextLogger := log.FromContext(ctx)
+	for idx := range pvcs {
+		pvc := pvcs[idx]
+		contextLogger.Info("Removing PVC cluster owner reference",
+			"pvc", pvc.Name,
+			"owner references", pvc.OwnerReferences)
+
+		if _, isOwned := IsOwnedByCluster(&pvc); !isOwned {
+			contextLogger.Info("PVC is not owned; skipping")
+			continue
+		}
+
+		newPVC := pvc.DeepCopy()
+
+		instanceName := fmt.Sprintf("%s-%s", cluster.Name, pvc.Annotations[specs.ClusterSerialAnnotationName])
+
+		newPVC.OwnerReferences = removeOwnerReference(pvc.OwnerReferences, cluster.Name)
+		newPVC.Annotations[specs.PVCStatusAnnotationName] = specs.PVCStatusDetached
+		newPVC.Labels[utils.InstanceNameLabelName] = instanceName
+		updated = true
+		err = r.Patch(ctx, newPVC, client.MergeFrom(&pvc))
+		if err != nil {
+			return updated, err
+		}
+
+		contextLogger.Info("Successfully removed PVC cluster owner reference",
+			"pvc name", pvc.Name,
+			"owner references", newPVC.OwnerReferences)
+	}
+
+	return updated, nil
+}
+
+// removeOwnerReference removes the owner reference to the cluster
+func removeOwnerReference(references []metav1.OwnerReference, clusterName string) []metav1.OwnerReference {
+	for i := range references {
+		if references[i].Name == clusterName && references[i].Kind == "Cluster" {
+			references = append(references[:i], references[i+1:]...)
+			break
+		}
+	}
+	return references
 }

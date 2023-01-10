@@ -1997,7 +1997,7 @@ spec:
               instances:
                 default: 1
                 description: Number of instances required in the cluster
-                minimum: 1
+                minimum: 0
                 type: integer
               logLevel:
                 default: info
@@ -2919,6 +2919,9 @@ spec:
                 items:
                   type: string
                 type: array
+              hibernating:
+                description: Boolean to indicate if the cluster is hibernating
+                type: boolean
               initializingPVC:
                 description: List of all the PVCs that are being initialized by this
                   cluster

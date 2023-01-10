@@ -423,6 +423,7 @@ Name                      | Description                                         
 `azurePVCUpdateEnabled    ` | AzurePVCUpdateEnabled shows if the PVC online upgrade is enabled for this cluster                                                                                                  | bool                                                       
 `conditions               ` | Conditions for cluster object                                                                                                                                                      | []metav1.Condition                                         
 `instanceNames            ` | List of instance names in the cluster                                                                                                                                              | []string                                                   
+`hibernating              ` | Boolean to indicate if the cluster is hibernating                                                                                                                                  | bool                                                       
 
 <a id='ConfigMapKeySelector'></a>
 
